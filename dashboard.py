@@ -7,6 +7,7 @@ import streamlit as st
 import sqlite3
 import json
 import os
+import textwrap
 import pandas as pd
 from datetime import datetime
 
@@ -170,6 +171,30 @@ html, body, [class*="css"] {
     padding-bottom: 0.45rem;
     margin-bottom: 0.9rem;
 }
+
+/* ── Feed scroll container (caps height so columns stay balanced) ── */
+.feed-scroll {
+    max-height: 720px;
+    overflow-y: auto;
+    padding-right: 6px;
+}
+.feed-scroll::-webkit-scrollbar { width: 6px; }
+.feed-scroll::-webkit-scrollbar-track { background: #0a0e18; border-radius: 3px; }
+.feed-scroll::-webkit-scrollbar-thumb { background: #232b45; border-radius: 3px; }
+.feed-scroll::-webkit-scrollbar-thumb:hover { background: #2e3856; }
+
+/* ── Right column panel wrapper (visually anchors sidebar as one unit) ── */
+.right-panel {
+    background: #0a0e18;
+    border: 1px solid #161c2e;
+    border-radius: 10px;
+    padding: 1.1rem 1.25rem 1.25rem;
+    height: 720px;
+    overflow-y: auto;
+}
+.right-panel::-webkit-scrollbar { width: 6px; }
+.right-panel::-webkit-scrollbar-track { background: #0a0e18; border-radius: 3px; }
+.right-panel::-webkit-scrollbar-thumb { background: #232b45; border-radius: 3px; }
 
 /* ── Decision cards ── */
 .dcard {
@@ -396,6 +421,21 @@ def fmt_ts(ts):
         return dt.strftime("%b %d, %H:%M")
     except: return str(ts)[:16]
 
+def clean(html_block: str) -> str:
+    """
+    Strip leading indentation from every line of a multi-line HTML block.
+
+    Why this exists: when an HTML string is built inside nested Python
+    blocks (loops, `with` blocks), each line ends up prefixed with extra
+    spaces from the source code's own indentation. Streamlit's markdown
+    renderer treats any line starting with 4+ spaces as a Markdown
+    "indented code block" — which breaks raw HTML parsing for every line
+    after the first one. textwrap.dedent() (applied per-fragment, since
+    fragments are joined at different indentation levels) removes that
+    common leading whitespace so the HTML parses as HTML, not code.
+    """
+    return textwrap.dedent(html_block).strip()
+
 # ── Load ────────────────────────────────────────────────────────────────────
 df = load_decisions()
 
@@ -409,7 +449,7 @@ if not df.empty:
     caught_amount = df[df.final_outcome.isin(["rejected","escalated"])].amount.sum()
 
 # ── Hero ────────────────────────────────────────────────────────────────────
-st.markdown(f"""
+st.markdown(clean(f"""
 <div class="hero">
   <div class="hero-left">
     <div class="hero-title">Two<span>Keys</span></div>
@@ -427,11 +467,11 @@ st.markdown(f"""
     </div>
   </div>
 </div>
-""", unsafe_allow_html=True)
+"""), unsafe_allow_html=True)
 
 # ── Metric cards ─────────────────────────────────────────────────────────────
 approve_rate = f"{approved/total*100:.0f}%" if total > 0 else "—"
-st.markdown(f"""
+st.markdown(clean(f"""
 <div class="metric-grid">
   <div class="mcard mcard-accent">
     <div class="mcard-value">{total}</div>
@@ -454,7 +494,7 @@ st.markdown(f"""
     <div class="mcard-delta">agent disagreements + failures</div>
   </div>
 </div>
-""", unsafe_allow_html=True)
+"""), unsafe_allow_html=True)
 
 # ── Main columns ──────────────────────────────────────────────────────────────
 left, right = st.columns([3, 2], gap="large")
@@ -483,7 +523,13 @@ with left:
         if fdf.empty:
             st.markdown('<div class="empty">No matching decisions.</div>', unsafe_allow_html=True)
         else:
-            for _, row in fdf.head(15).iterrows():
+            # All cards render inside one scrollable container (.feed-scroll)
+            # so the left column has a fixed visual height that matches the
+            # right sidebar panel. Each card fragment is passed through
+            # clean() individually before joining, so every fragment's own
+            # indentation is stripped relative to itself.
+            card_fragments = []
+            for _, row in fdf.iterrows():
                 b = parse_json(row.get("builder_decision"))
                 a = parse_json(row.get("auditor_verdict"))
                 b_action   = b.get("action", "—").upper()
@@ -494,7 +540,7 @@ with left:
                 desc_short = desc[:65] + "…" if len(desc) > 65 else desc
                 outcome    = str(row.final_outcome)
 
-                st.markdown(f"""
+                fragment = f"""
                 <div class="dcard">
                   <div class="dcard-stripe {stripe_class(outcome)}"></div>
                   <div class="dcard-body">
@@ -525,20 +571,28 @@ with left:
                     </div>
                   </div>
                 </div>
-                """, unsafe_allow_html=True)
+                """
+                card_fragments.append(clean(fragment))
+
+            full_feed_html = '<div class="feed-scroll">' + "".join(card_fragments) + '</div>'
+            st.markdown(full_feed_html, unsafe_allow_html=True)
 
 # ── Right panel ───────────────────────────────────────────────────────────────
 with right:
+    # Everything in the sidebar is assembled into one HTML string and
+    # wrapped in .right-panel. Each fragment is cleaned individually
+    # before joining, same reasoning as the feed above.
+    panel_parts = []
 
     # Outcome bars
-    st.markdown('<div class="sec-hdr">Outcome breakdown</div>', unsafe_allow_html=True)
+    panel_parts.append('<div class="sec-hdr">Outcome breakdown</div>')
     if total > 0:
         for label, count, pct, color in [
             ("Approved",  approved,  approved/total*100,  "#10b981"),
             ("Rejected",  rejected,  rejected/total*100,  "#ef4444"),
             ("Escalated", escalated, escalated/total*100, "#f59e0b"),
         ]:
-            st.markdown(f"""
+            panel_parts.append(clean(f"""
             <div class="bar-row">
               <div class="bar-top">
                 <span>{label}</span>
@@ -548,14 +602,14 @@ with right:
                 <div style="background:{color};width:{pct}%;height:3px;border-radius:2px"></div>
               </div>
             </div>
-            """, unsafe_allow_html=True)
+            """))
     else:
-        st.markdown('<div class="empty" style="padding:1rem">No data</div>', unsafe_allow_html=True)
+        panel_parts.append('<div class="empty" style="padding:1rem">No data</div>')
 
-    st.markdown('<hr class="div">', unsafe_allow_html=True)
+    panel_parts.append('<hr class="div">')
 
     # Vendor risk
-    st.markdown('<div class="sec-hdr">Vendor risk registry</div>', unsafe_allow_html=True)
+    panel_parts.append('<div class="sec-hdr">Vendor risk registry</div>')
     if not df.empty:
         vs = df.groupby("vendor").agg(
             total=("request_id","count"),
@@ -570,7 +624,7 @@ with right:
             pct = min(int(v.score / max_score * 100), 100)
             color = "#ef4444" if v.score >= 2 else "#f59e0b" if v.score >= 1 else "#10b981"
             vn = str(v.vendor)[:24] + ("…" if len(str(v.vendor)) > 24 else "")
-            st.markdown(f"""
+            panel_parts.append(clean(f"""
             <div class="vrow">
               <div>
                 <div class="vname2">{vn}</div>
@@ -582,36 +636,36 @@ with right:
                 </div>
               </div>
             </div>
-            """, unsafe_allow_html=True)
+            """))
     else:
-        st.markdown('<div class="empty" style="padding:1rem">No vendor data</div>', unsafe_allow_html=True)
+        panel_parts.append('<div class="empty" style="padding:1rem">No vendor data</div>')
 
-    st.markdown('<hr class="div">', unsafe_allow_html=True)
+    panel_parts.append('<hr class="div">')
 
     # Recent escalations
-    st.markdown('<div class="sec-hdr">Recent escalations</div>', unsafe_allow_html=True)
+    panel_parts.append('<div class="sec-hdr">Recent escalations</div>')
     if not df.empty:
         esc_df = df[df.final_outcome == "escalated"].head(4)
         if esc_df.empty:
-            st.markdown('<div style="font-size:0.78rem;color:#1e293b;padding:0.5rem 0">No escalations recorded</div>', unsafe_allow_html=True)
+            panel_parts.append('<div style="font-size:0.78rem;color:#1e293b;padding:0.5rem 0">No escalations recorded</div>')
         else:
             for _, row in esc_df.iterrows():
                 desc = str(row.description)
-                st.markdown(f"""
+                panel_parts.append(clean(f"""
                 <div class="esc-row">
                   <div class="esc-vendor">{row.vendor}</div>
                   <div class="esc-meta">{fmt_amt(row.amount)} · {fmt_ts(str(row.timestamp))}</div>
                   <div class="esc-desc">{desc[:90]}{"…" if len(desc)>90 else ""}</div>
                 </div>
-                """, unsafe_allow_html=True)
+                """))
     else:
-        st.markdown('<div style="font-size:0.78rem;color:#1e293b;padding:0.5rem 0">No data</div>', unsafe_allow_html=True)
+        panel_parts.append('<div style="font-size:0.78rem;color:#1e293b;padding:0.5rem 0">No data</div>')
 
-    st.markdown('<hr class="div">', unsafe_allow_html=True)
+    panel_parts.append('<hr class="div">')
 
     # Architecture flow
-    st.markdown('<div class="sec-hdr">Agent architecture</div>', unsafe_allow_html=True)
-    st.markdown("""
+    panel_parts.append('<div class="sec-hdr">Agent architecture</div>')
+    panel_parts.append(clean("""
     <div class="arch-box">
       <div class="arch-flow">
         <span class="arch-node">intake</span>
@@ -629,17 +683,20 @@ with right:
         Disagreement → automatic human escalation. Agent failure → fail-safe escalation. Never silent.
       </div>
     </div>
-    """, unsafe_allow_html=True)
+    """))
+
+    full_panel_html = f'<div class="right-panel">{"".join(panel_parts)}</div>'
+    st.markdown(full_panel_html, unsafe_allow_html=True)
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 col1, col2 = st.columns([3, 1])
 with col1:
-    st.markdown("""
+    st.markdown(clean("""
     <div class="footer">
       <span>TWOKEYS · DUAL-AGENT EXPENSE INTELLIGENCE · KAGGLE 5-DAY AI AGENT CAPSTONE 2026</span>
       <span>Google ADK 2.0 · Gemini 2.5 Flash · Antigravity IDE</span>
     </div>
-    """, unsafe_allow_html=True)
+    """), unsafe_allow_html=True)
 with col2:
     if st.button("↺  Refresh feed", use_container_width=True):
         st.cache_data.clear()
