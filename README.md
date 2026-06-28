@@ -207,7 +207,7 @@ Stack: Google ADK 2.0 · Gemini 2.0 Flash · Antigravity IDE · Python 3.13 · S
 
 
 
-*## Live Demo*
+**#Live Demo**
 
 
 
