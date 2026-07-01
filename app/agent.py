@@ -47,10 +47,14 @@ if os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "True").lower() == "true":
             pass
     os.environ.setdefault("GOOGLE_CLOUD_LOCATION", "global")
 else:
-    # Explicitly using Gemini Developer API (AI Studio)
+    # Explicitly using Gemini Developer API (AI Studio) instead of Vertex AI.
+    # Chosen for this project because it requires no GCP billing setup,
+    # keeping the system runnable with just a free API key.
     os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "False"
 
-# Blocked Vendors Set
+# Deterministic blocklist, checked in code rather than left to LLM judgment.
+# This is a deliberate security boundary: a list membership check cannot be
+# "talked out of" the way a model's safety instructions sometimes can.
 BLOCKED_VENDORS = {"BlockedInc", "Shady Supplies Co", "Offshore Holdings LLC"}
 
 
@@ -62,6 +66,9 @@ class ExpenseRequest(BaseModel):
     vendor_history: str = Field(default="", description="Summary of past requests and outcomes for this vendor")
 
 
+# Structured output schemas for both agents. Using Pydantic schemas instead of
+# free-form text means each agent's response is a typed, validated object —
+# not a string that needs fragile regex/string parsing to extract a verdict.
 class BuilderDecision(BaseModel):
     action: Literal["approve", "deny"] = Field(description="The decision action: approve or deny")
     amount: float = Field(description="The expense amount")
@@ -74,7 +81,15 @@ class AuditorVerdict(BaseModel):
 
 
 async def retry_with_backoff(coro, max_attempts=3, initial_delay=1.0, backoff_factor=2.0):
-    """Helper function to retry a coroutine with exponential backoff."""
+    """Helper function to retry a coroutine with exponential backoff.
+
+    Distinguishes between transient capacity errors (429/503/quota) and other
+    failures: capacity errors get a fixed 30s backoff since they're usually
+    resolved by a short wait, while other errors use exponential backoff.
+    Both paths eventually surface to the caller, which is what allows the
+    Builder/Auditor wrappers below to fail safely into human escalation
+    rather than retrying forever or crashing the whole workflow.
+    """
     delay = initial_delay
     for attempt in range(max_attempts):
         try:
@@ -124,7 +139,7 @@ def parse_expense_request(text: str) -> ExpenseRequest:
         num_match = re.search(r"\$?([0-9.]+)", text)
         if num_match:
             amount = float(num_match.group(1))
-        
+
         # Heuristics to map loose user strings to mock blocked vendors
         if "blockedinc" in text.lower():
             vendor = "BlockedInc"
@@ -142,7 +157,14 @@ def parse_expense_request(text: str) -> ExpenseRequest:
 
 
 def intake(ctx: Context, node_input: Any) -> Event:
-    """Intakes the user request, parses the expense, and routes based on amount."""
+    """Intakes the user request, parses the expense, and routes based on amount.
+
+    Routing on amount (auto-approve under $100) is a deliberate efficiency
+    decision: running two LLM agents on every trivial expense would waste
+    quota and latency on requests that pose negligible risk. The $100
+    threshold concentrates agent reasoning on the requests where it actually
+    matters.
+    """
     text = ""
     if isinstance(node_input, dict):
         req = ExpenseRequest(
@@ -157,19 +179,23 @@ def intake(ctx: Context, node_input: Any) -> Event:
             text = node_input
         elif node_input is not None:
             text = str(node_input)
-        
+
         req = parse_expense_request(text)
 
     # Attach blocked vendor status
     req.vendor_blocked = req.vendor in BLOCKED_VENDORS
-    
-    # Query and attach vendor history
+
+    # Long-term memory in action: every request is enriched with the
+    # vendor's historical outcome pattern before either agent reasons about
+    # it. This is what lets the Auditor apply extra scrutiny to repeat
+    # offenders (see auditor_agent's instructions below) rather than
+    # evaluating every request as if it were the vendor's first.
     history = get_vendor_history(req.vendor)
     req.vendor_history = history.get("summary", "")
-    
+
     # Generate unique request ID for persistent memory
     request_id = str(uuid.uuid4())
-    
+
     req_dict = req.model_dump()
     state_delta = {
         "expense_request": req_dict,
@@ -182,7 +208,12 @@ def intake(ctx: Context, node_input: Any) -> Event:
         return Event(output=req_dict, route="auto_approve", state=state_delta)
 
 
-# LLM builder agent
+# LLM builder agent.
+#
+# DESIGN NOTE: the Builder is the *first* opinion, not the final word. Its
+# job is to make an initial policy call. It is deliberately not trusted
+# alone — see route_auditor_verdict() below, which requires the Auditor to
+# independently reach the same conclusion before anything is finalized.
 builder_agent = LlmAgent(
     name="builder_agent",
     model="gemini-2.5-flash",
@@ -207,7 +238,15 @@ Generate a structured decision matching the output schema.
 
 @node(rerun_on_resume=True)
 async def run_builder(ctx: Context, node_input: Any) -> Event:
-    """Wrapper function to run the builder agent with retries and exception handling."""
+    """Wrapper function to run the builder agent with retries and exception handling.
+
+    SECURITY NOTE: if the Builder ultimately fails after retries, this does
+    NOT default to either approve or deny. It returns a deny placeholder and
+    sets `builder_failed`, which forces the workflow into human escalation
+    downstream (see route_auditor_verdict and human_escalation). An
+    infrastructure failure must never be allowed to silently resolve into an
+    approval.
+    """
     try:
         # Wrap the node execution in a lambda to allow retrying/re-invoking the coroutine
         result = await retry_with_backoff(
@@ -225,7 +264,17 @@ async def run_builder(ctx: Context, node_input: Any) -> Event:
         )
 
 
-# LLM auditor agent (evaluates independently without builder's decision)
+# LLM auditor agent (evaluates independently without builder's decision).
+#
+# DESIGN NOTE (the core security property of this system): the Auditor's
+# prompt never includes the Builder's decision or reasoning anywhere in its
+# context. It only receives the same raw expense facts the Builder saw. This
+# is what makes the two-agent check meaningful rather than theatrical — if
+# the Auditor could see "the Builder already approved this," it would have
+# every incentive (and an LLM's natural tendency toward agreement) to rubber
+# -stamp rather than independently re-derive a verdict. A prompt injection
+# or reasoning error that fools the Builder still has to separately fool the
+# Auditor, with no shared context to exploit.
 auditor_agent = LlmAgent(
     name="auditor_agent",
     model="gemini-2.5-flash",
@@ -254,7 +303,14 @@ Your Job:
 
 @node(rerun_on_resume=True)
 async def run_auditor(ctx: Context, node_input: Any) -> Event:
-    """Wrapper function to run the auditor agent with retries and exception handling."""
+    """Wrapper function to run the auditor agent with retries and exception handling.
+
+    If the Builder already failed, the Auditor is skipped entirely (no point
+    spending a second LLM call when the workflow is already routed to human
+    escalation) and an explicit escalate verdict is returned with a message
+    naming the failure, so the human reviewer knows *why* this needs review,
+    not just that it does.
+    """
     if ctx.state.get("builder_failed"):
         return Event(
             output={"verdict": "escalate", "reasoning": "Builder agent call failed, skipping auditor."},
@@ -277,14 +333,22 @@ async def run_auditor(ctx: Context, node_input: Any) -> Event:
 
 
 def route_auditor_verdict(ctx: Context, node_input: Any) -> Event:
-    """Compares the independent auditor's verdict with the builder's decision in code."""
+    """Compares the independent auditor's verdict with the builder's decision in code.
+
+    DESIGN NOTE: this comparison is deliberately plain Python, not a third
+    LLM call asking "do these two agree." Letting a model judge agreement
+    would reintroduce exactly the failure mode this architecture exists to
+    avoid — a single point of (model) judgment that could itself be wrong or
+    manipulated. A direct string/value comparison in code is deterministic,
+    fully testable, and impossible to prompt-inject.
+    """
     if ctx.state.get("builder_failed") or ctx.state.get("auditor_failed"):
         # Force route to escalate on agent failures
         return Event(output=node_input, route="escalate")
 
     builder_decision = ctx.state.get("builder_decision", {})
     builder_action = builder_decision.get("action")  # "approve" or "deny"
-    
+
     # Extract independent auditor action
     auditor_action = "escalate"
     if isinstance(node_input, dict):
@@ -307,7 +371,11 @@ def route_auditor_verdict(ctx: Context, node_input: Any) -> Event:
     if auditor_action == "escalate":
         return Event(output=node_input, route="escalate")
 
-    # Check for agreement or disagreement between builder and auditor
+    # Check for agreement or disagreement between builder and auditor.
+    # Agreement -> automatic resolution. Any disagreement -> automatic
+    # escalation, with no "tie-breaker" logic of any kind. A 50/50 split
+    # between two independent agents is exactly the signal that a human
+    # should look at this request, not a case to resolve programmatically.
     if builder_action == auditor_action:
         if builder_action == "approve":
             return Event(output=node_input, route="confirm")
@@ -319,7 +387,15 @@ def route_auditor_verdict(ctx: Context, node_input: Any) -> Event:
 
 
 async def human_escalation(ctx: Context, node_input: Any):
-    """Asks for human decision when auditor escalates or agent calls fail."""
+    """Asks for human decision when auditor escalates or agent calls fail.
+
+    The escalation message explicitly names which agent failed and why
+    (when applicable), so a human reviewer isn't left guessing why a
+    request landed in their queue. Every escalated decision is also written
+    to the database *before* the human responds, so the audit trail shows
+    the request was correctly flagged even if the human review happens
+    later.
+    """
     req = ctx.state.get("expense_request", {})
     builder_decision = ctx.state.get("builder_decision")
     auditor_verdict = ctx.state.get("auditor_verdict")
@@ -342,7 +418,7 @@ async def human_escalation(ctx: Context, node_input: Any):
             auditor_verdict=auditor_verdict,
             final_outcome="escalated"
         )
-        
+
         yield RequestInput(
             interrupt_id="human_verdict",
             message=f"Expense escalated for review{failure_msg}. Do you approve? (yes/no)"
@@ -418,7 +494,14 @@ def rejected(ctx: Context, node_input: Any) -> str:
     return f"Expense rejected. Reason: {reasoning}\n{details}"
 
 
-# Define the workflow graph
+# Define the workflow graph.
+#
+# Five nodes encode the entire dual-agent safety property structurally:
+# intake -> (Builder, Auditor independently) -> deterministic routing ->
+# {confirm, block, escalate}. There is no path through this graph where a
+# single agent's output alone produces a final approved/rejected outcome —
+# every approval or rejection requires the route_auditor_verdict node to
+# observe agreement between two independently-derived verdicts.
 root_agent = Workflow(
     name="twokeys_workflow",
     edges=[

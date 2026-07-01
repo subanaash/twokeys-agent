@@ -19,12 +19,25 @@ import sqlite3
 
 
 def get_db_path() -> str:
-    """Returns the database file path, allowing dynamic overrides."""
+    """Returns the database file path, allowing dynamic overrides.
+
+    Reads from TWOKEYS_DB_PATH so the dashboard, the local batch runner, and
+    the live agent workflow can all point at the same database without any
+    of them hardcoding a path — useful for keeping a separate eval database
+    isolated from production decision history during testing.
+    """
     return os.environ.get("TWOKEYS_DB_PATH", "twokeys_memory.db")
 
 
 def init_db() -> None:
-    """Initialize the SQLite database and create the table if it doesn't exist."""
+    """Initialize the SQLite database and create the table if it doesn't exist.
+
+    SQLite was chosen deliberately over a vector store for this skill.
+    Vendor history is structured, relational data (counts, timestamps,
+    categorical outcomes) — a vector store would add an external dependency
+    and embedding overhead for data that a simple SQL query already serves
+    efficiently and deterministically.
+    """
     conn = sqlite3.connect(get_db_path())
     cursor = conn.cursor()
     cursor.execute("""
@@ -52,7 +65,15 @@ def save_decision(
     auditor_verdict: dict | None,
     final_outcome: str,
 ) -> None:
-    """Inserts or replaces an expense decision record in the database."""
+    """Inserts or replaces an expense decision record in the database.
+
+    This is the single write path for every decision the system makes,
+    called from every terminal node in the workflow (approved, rejected,
+    and escalated). Both agents' full reasoning is persisted alongside the
+    outcome, not just the final verdict — this is what makes every decision
+    in the dashboard fully explainable after the fact, not just logged as a
+    bare approve/deny.
+    """
     init_db()
     conn = sqlite3.connect(get_db_path())
     cursor = conn.cursor()
@@ -63,7 +84,7 @@ def save_decision(
 
     cursor.execute(
         """
-        INSERT OR REPLACE INTO expense_decisions 
+        INSERT OR REPLACE INTO expense_decisions
         (request_id, timestamp, vendor, amount, description, builder_decision, auditor_verdict, final_outcome)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """,
@@ -83,7 +104,18 @@ def save_decision(
 
 
 def get_vendor_history(vendor: str) -> dict:
-    """Queries the database to return a short summary of a vendor's history."""
+    """Queries the database to return a short summary of a vendor's history.
+
+    This is the core "agent skill": rather than handing the Auditor agent
+    raw database rows (which would burn tokens and add noise the model has
+    to parse), this function pre-aggregates the vendor's history into a
+    single natural-language sentence the Auditor's prompt can use directly.
+    The Auditor's instructions explicitly tell it to apply extra scrutiny
+    when past_rejections >= 2 — meaning this summary actively changes agent
+    behavior on repeat offenders, not just logs history for a human to read
+    later. This is long-term memory functioning as a skill, not just
+    storage.
+    """
     init_db()
     conn = sqlite3.connect(get_db_path())
     cursor = conn.cursor()
